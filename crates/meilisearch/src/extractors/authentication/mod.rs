@@ -144,7 +144,7 @@ pub trait Policy {
 pub mod policies {
     use actix_web::web::Data;
     use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-    use meilisearch_auth::{AuthController, AuthFilter, SearchRules};
+    use meilisearch_auth::{AuthController, AuthFilter, IndexRules, SearchRules};
     use meilisearch_types::error::{Code, ErrorCode};
     // reexport actions in policies in order to be used in routes configuration.
     pub use meilisearch_types::keys::{actions, Action};
@@ -156,7 +156,7 @@ pub mod policies {
 
     enum TenantTokenOutcome {
         NotATenantToken,
-        Valid(Uuid, SearchRules),
+        Valid(Uuid, SearchRules, Option<IndexRules>),
     }
 
     #[derive(thiserror::Error, Debug)]
@@ -245,16 +245,17 @@ pub mod policies {
                 return Ok(AuthFilter::default());
             }
 
-            let (key_uuid, search_rules) =
+            let (key_uuid, search_rules, index_rules) =
                 match ActionPolicy::<A>::authenticate_tenant_token(&auth, token) {
-                    Ok(TenantTokenOutcome::Valid(key_uuid, search_rules)) => {
-                        (key_uuid, Some(search_rules))
+                    Ok(TenantTokenOutcome::Valid(key_uuid, search_rules, index_rules)) => {
+                        (key_uuid, Some(search_rules), index_rules)
                     }
                     Ok(TenantTokenOutcome::NotATenantToken)
                     | Err(AuthError::InvalidTenantToken) => (
                         auth.get_optional_uid_from_encoded_key(token.as_bytes())
                             .map_err(|_e| AuthError::InvalidApiKey)?
                             .ok_or(AuthError::InvalidApiKey)?,
+                        None,
                         None,
                     ),
                     Err(e) => return Err(e),
@@ -263,7 +264,7 @@ pub mod policies {
             // check that the indexes are allowed
             let action = Action::from_repr(A).ok_or(AuthError::InternalInvalidAction(A))?;
             let auth_filter = auth
-                .get_key_filters(key_uuid, search_rules)
+                .get_key_filters(key_uuid, search_rules, index_rules)
                 .map_err(|_e| AuthError::InvalidApiKey)?;
 
             // First check if the index is authorized in the tenant token, this is a public
@@ -305,8 +306,9 @@ pub mod policies {
             auth: &AuthController,
             token: &str,
         ) -> Result<TenantTokenOutcome, AuthError> {
-            // Only search and chat actions can be accessed by a tenant token.
-            if A != actions::SEARCH && A != actions::CHAT_COMPLETIONS {
+            // Only search, chat, and document browse actions can be accessed by a tenant token.
+            if A != actions::SEARCH && A != actions::CHAT_COMPLETIONS && A != actions::DOCUMENTS_GET
+            {
                 return Ok(TenantTokenOutcome::NotATenantToken);
             }
 
@@ -333,7 +335,7 @@ pub mod policies {
                 }
             }
 
-            Ok(TenantTokenOutcome::Valid(uid, data.claims.search_rules))
+            Ok(TenantTokenOutcome::Valid(uid, data.claims.search_rules, data.claims.index_rules))
         }
     }
 
@@ -341,6 +343,8 @@ pub mod policies {
     #[serde(rename_all = "camelCase")]
     struct Claims {
         search_rules: SearchRules,
+        #[serde(default)]
+        index_rules: Option<IndexRules>,
         exp: Option<i64>,
         api_key_uid: Uuid,
     }
