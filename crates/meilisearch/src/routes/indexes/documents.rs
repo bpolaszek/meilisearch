@@ -50,7 +50,7 @@ use crate::routes::indexes::search::fix_sort_query_parameters;
 use crate::routes::{
     get_task_id, is_dry_run, PaginationView, SummarizedTaskView, PAGINATION_DEFAULT_LIMIT,
 };
-use crate::search::{parse_filter, ExternalDocumentId, RetrieveVectors};
+use crate::search::{fuse_filters, parse_filter, ExternalDocumentId, RetrieveVectors};
 use crate::{aggregate_methods, Opt};
 
 static ACCEPTED_CONTENT_TYPE: Lazy<Vec<String>> = Lazy::new(|| {
@@ -271,9 +271,54 @@ pub async fn get_document(
         &req,
     );
 
+    let index_uid_str: &str = index_uid.as_ref();
+
+    // Fail-closed: tenant tokens without indexRules authorization are forbidden on document endpoints.
+    if index_scheduler.filters().is_tenant_token()
+        && !index_scheduler.filters().is_index_browse_authorized(index_uid_str)
+    {
+        return Err(ResponseError::from_msg(
+            format!(
+                "The provided token does not have access to document browsing on index `{index_uid_str}`."
+            ),
+            Code::InvalidApiKey,
+        ));
+    }
+
     let index = index_scheduler.index(&index_uid)?;
-    let document =
-        retrieve_document(&index, &document_id, attributes_to_retrieve, retrieve_vectors)?;
+
+    // Compute allowed document IDs from indexRules filter (if tenant token with filter).
+    let allowed_ids = if let Some(browse_rules) =
+        index_scheduler.filters().get_index_browse_rules(index_uid_str)
+    {
+        if let Some(filter_value) = browse_rules.filter {
+            let features = index_scheduler.features();
+            let rtxn = index.read_txn()?;
+            let parsed = parse_filter(&filter_value, Code::InvalidDocumentFilter, features)?;
+            if let Some(filter) = parsed {
+                Some(filter.evaluate(&rtxn, &index).map_err(|err| match err {
+                    milli::Error::UserError(milli::UserError::InvalidFilter(_)) => {
+                        ResponseError::from_msg(err.to_string(), Code::InvalidDocumentFilter)
+                    }
+                    e => e.into(),
+                })?)
+            } else {
+                None
+            }
+        } else {
+            None // IndexBrowseRules with no filter = whitelisted index, no restriction
+        }
+    } else {
+        None // Not a tenant token or no browse rules — no restriction
+    };
+
+    let document = retrieve_document(
+        &index,
+        &document_id,
+        attributes_to_retrieve,
+        retrieve_vectors,
+        allowed_ids.as_ref(),
+    )?;
     debug!(returns = ?document, "Get document");
     Ok(HttpResponse::Ok().json(document))
 }
@@ -591,6 +636,25 @@ pub async fn documents_by_query_post(
         &req,
     );
 
+    // Fail-closed: tenant tokens without explicit indexRules access are forbidden on document list endpoints.
+    let index_uid_str = index_uid.as_ref();
+    if index_scheduler.filters().is_tenant_token()
+        && !index_scheduler.filters().is_index_browse_authorized(index_uid_str)
+    {
+        return Err(ResponseError::from_msg(
+            format!(
+                "The provided token does not have access to document browsing on index `{index_uid_str}`."
+            ),
+            Code::InvalidApiKey,
+        ));
+    }
+
+    // Inject indexRules filter for tenant tokens that carry a filter in their claim.
+    let mut body = body;
+    if let Some(browse_rules) = index_scheduler.filters().get_index_browse_rules(index_uid_str) {
+        body.filter = fuse_filters(body.filter.take(), browse_rules.filter);
+    }
+
     documents_by_query(&index_scheduler, index_uid, body)
 }
 
@@ -668,7 +732,7 @@ pub async fn get_documents(
         None => None,
     };
 
-    let query = BrowseQuery {
+    let mut query = BrowseQuery {
         offset: offset.0,
         limit: limit.0,
         fields: fields.merge_star_and_none(),
@@ -695,6 +759,24 @@ pub async fn get_documents(
         },
         &req,
     );
+
+    // Fail-closed: tenant tokens without explicit indexRules access are forbidden on document list endpoints.
+    let index_uid_str = index_uid.as_ref();
+    if index_scheduler.filters().is_tenant_token()
+        && !index_scheduler.filters().is_index_browse_authorized(index_uid_str)
+    {
+        return Err(ResponseError::from_msg(
+            format!(
+                "The provided token does not have access to document browsing on index `{index_uid_str}`."
+            ),
+            Code::InvalidApiKey,
+        ));
+    }
+
+    // Inject indexRules filter for tenant tokens that carry a filter in their claim.
+    if let Some(browse_rules) = index_scheduler.filters().get_index_browse_rules(index_uid_str) {
+        query.filter = fuse_filters(query.filter.take(), browse_rules.filter);
+    }
 
     documents_by_query(&index_scheduler, index_uid, query)
 }
@@ -1947,6 +2029,7 @@ fn retrieve_document<S: AsRef<str>>(
     doc_id: &str,
     attributes_to_retrieve: Option<Vec<S>>,
     retrieve_vectors: RetrieveVectors,
+    allowed_ids: Option<&RoaringBitmap>,
 ) -> Result<Document, ResponseError> {
     let txn = index.read_txn()?;
 
@@ -1954,6 +2037,14 @@ fn retrieve_document<S: AsRef<str>>(
         .external_documents_ids()
         .get(&txn, doc_id)?
         .ok_or_else(|| MeilisearchHttpError::DocumentNotFound(doc_id.to_string()))?;
+
+    // If tenant filter restricts document access, check the document is in scope.
+    // Return 404 (not 403) to avoid confirming document existence to unauthorized tenant.
+    if let Some(allowed) = allowed_ids {
+        if !allowed.contains(internal_id) {
+            return Err(MeilisearchHttpError::DocumentNotFound(doc_id.to_string()).into());
+        }
+    }
 
     let document = some_documents(index, &txn, Some(internal_id), retrieve_vectors)?
         .next()

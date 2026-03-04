@@ -571,7 +571,8 @@ async fn invalid_tenant_token() {
     let server = Server::new_auth().await;
     let app = server.init_web_app().await;
 
-    // The tenant token won't be recognized at all if we're not on a search route
+    // Tenant tokens are now also recognized on document browse routes (documents.get).
+    // A malformed JWT on GET /indexes/:index/documents attempts tenant token decode and fails.
     let claims = json!({ "tamo": "kefir" });
     let jwt = jsonwebtoken::encode(&Header::default(), &claims, &EncodingKey::from_secret(b"tamo"))
         .unwrap();
@@ -581,7 +582,7 @@ async fn invalid_tenant_token() {
     snapshot!(status_code, @"403 Forbidden");
     snapshot!(response, @r###"
     {
-      "message": "The provided API key is invalid.",
+      "message": "Could not decode tenant token, JSON error: missing field `searchRules` at line 1 column 16.",
       "code": "invalid_api_key",
       "type": "auth",
       "link": "https://docs.meilisearch.com/errors#invalid_api_key"

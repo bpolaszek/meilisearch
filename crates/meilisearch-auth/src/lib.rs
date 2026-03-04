@@ -94,6 +94,7 @@ impl AuthController {
         &self,
         uid: Uuid,
         search_rules: Option<SearchRules>,
+        index_rules: Option<IndexRules>,
     ) -> Result<AuthFilter> {
         let key = self.get_key(uid)?;
 
@@ -101,7 +102,7 @@ impl AuthController {
 
         let allow_index_creation = self.is_key_authorized(uid, Action::IndexesAdd, None)?;
 
-        Ok(AuthFilter { search_rules, key_authorized_indexes, allow_index_creation })
+        Ok(AuthFilter { search_rules, index_rules, key_authorized_indexes, allow_index_creation })
     }
 
     pub fn list_keys(&self) -> Result<Vec<Key>> {
@@ -168,6 +169,7 @@ impl AuthController {
 #[derive(Debug)]
 pub struct AuthFilter {
     search_rules: Option<SearchRules>,
+    index_rules: Option<IndexRules>,
     key_authorized_indexes: SearchRules,
     allow_index_creation: bool,
 }
@@ -176,6 +178,7 @@ impl Default for AuthFilter {
     fn default() -> Self {
         Self {
             search_rules: None,
+            index_rules: None,
             key_authorized_indexes: SearchRules::default(),
             allow_index_creation: true,
         }
@@ -189,14 +192,17 @@ impl AuthFilter {
     }
 
     #[inline]
-    /// Return true if a tenant token was used to generate the search rules.
+    /// Return true if a tenant token was used to generate the auth filter.
+    /// A JWT is considered a tenant token if it carries any tenant claim
+    /// (either `searchRules` or `indexRules`).
     pub fn is_tenant_token(&self) -> bool {
-        self.search_rules.is_some()
+        self.search_rules.is_some() || self.index_rules.is_some()
     }
 
     pub fn with_allowed_indexes(allowed_indexes: HashSet<IndexUidPattern>) -> Self {
         Self {
             search_rules: None,
+            index_rules: None,
             key_authorized_indexes: SearchRules::Set(allowed_indexes),
             allow_index_creation: false,
         }
@@ -265,6 +271,35 @@ impl AuthFilter {
         }
         let search_rules = self.search_rules.as_ref().unwrap_or(&self.key_authorized_indexes);
         search_rules.get_index_search_rules(index)
+    }
+
+    /// Return the browse rules to apply for a given index when using a tenant token
+    /// carrying an `indexRules` claim. Returns `None` if the index is not authorized
+    /// or if no `indexRules` were specified in the JWT.
+    pub fn get_index_browse_rules(&self, index: &str) -> Option<IndexBrowseRules> {
+        if !self.is_index_authorized(index) {
+            return None;
+        }
+        let index_rules = self.index_rules.as_ref()?;
+        index_rules.get_index_browse_rules(index)
+    }
+
+    /// Return true if this token explicitly authorizes document browsing on the given index.
+    ///
+    /// This is distinct from `get_index_browse_rules()` returning `Some` — an index can be
+    /// authorized with a `null` rule (no filter), which means `get_index_browse_rules()` returns
+    /// `None` but browsing is still allowed. Use this method for the fail-closed guard.
+    ///
+    /// Returns false when no `indexRules` claim is present (caller must check `is_tenant_token()`
+    /// first to distinguish "no claim" from "claim present but index not listed").
+    pub fn is_index_browse_authorized(&self, index: &str) -> bool {
+        if !self.is_index_authorized(index) {
+            return false;
+        }
+        match self.index_rules.as_ref() {
+            None => false,
+            Some(index_rules) => index_rules.is_index_authorized(index),
+        }
     }
 }
 
@@ -346,6 +381,66 @@ impl IntoIterator for SearchRules {
 /// filter: search filter to apply in addition to query filters.
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct IndexSearchRules {
+    pub filter: Option<serde_json::Value>,
+}
+
+/// Transparent wrapper around a list of allowed indexes with the browse rules to apply for each.
+/// Same shape as `SearchRules` — `Set` for whitelist, `Map` for per-index filter expressions.
+/// Kept as a distinct type to prevent accidental cross-wiring with `SearchRules`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum IndexRules {
+    Set(HashSet<IndexUidPattern>),
+    Map(HashMap<IndexUidPattern, Option<IndexBrowseRules>>),
+}
+
+impl Default for IndexRules {
+    fn default() -> Self {
+        Self::Set(hashset! { IndexUidPattern::all() })
+    }
+}
+
+impl IndexRules {
+    fn is_index_authorized(&self, index: &str) -> bool {
+        match self {
+            Self::Set(set) => {
+                set.contains("*")
+                    || set.contains(index)
+                    || set.iter().any(|pattern| pattern.matches_str(index))
+            }
+            Self::Map(map) => {
+                map.contains_key("*")
+                    || map.contains_key(index)
+                    || map.keys().any(|pattern| pattern.matches_str(index))
+            }
+        }
+    }
+
+    fn get_index_browse_rules(&self, index: &str) -> Option<IndexBrowseRules> {
+        match self {
+            Self::Set(_) => {
+                if self.is_index_authorized(index) {
+                    Some(IndexBrowseRules::default())
+                } else {
+                    None
+                }
+            }
+            Self::Map(map) => {
+                // Take the most restrictive rule matching this index uid pattern.
+                map.iter()
+                    .filter(|(pattern, _)| pattern.matches_str(index))
+                    .max_by_key(|(pattern, _)| (pattern.is_exact(), pattern.len()))
+                    .and_then(|(_, rule)| rule.clone())
+            }
+        }
+    }
+}
+
+/// Contains the rules to apply on the top of the document browse query for a specific index.
+///
+/// filter: browse filter to apply in addition to query filters.
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct IndexBrowseRules {
     pub filter: Option<serde_json::Value>,
 }
 
